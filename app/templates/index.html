@@ -78,6 +78,7 @@
           <tr>
             <td class="nowrap">
               <span class="small muted">{{ r.created_at }}</span>
+              {% if r.run_id == active_run_id %}<span class="tag ok">生效</span>{% endif %}
               <div class="small mono">{{ r.run_id }}</div>
             </td>
             <td class="cell-ellipsis">{{ r.source_label }}</td>

@@ -40,7 +40,7 @@
       <select name="run_id" id="run_id" aria-label="解析记录" style="min-width:240px">
         {% for r in runs %}
         <option value="{{ r.run_id }}" {% if r.run_id == run_id %}selected{% endif %}>
-          {{ r.created_at }} · {{ r.source_label }}（{{ r.column_edge_count }} 列边）
+          {{ r.created_at }} · {{ r.source_label }}（{{ r.column_edge_count }} 列边）{% if r.run_id == active_run_id %} · 生效结论{% endif %}
         </option>
         {% endfor %}
       </select>

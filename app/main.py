@@ -1,6 +1,7 @@
 """FastAPI 入口：路由保持薄，解析 / 血缘 / 图算法 / 迁移清单都在纯函数模块里。"""
 from __future__ import annotations
 
+import json
 import sqlite3
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -10,6 +11,7 @@ from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, Resp
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
+from . import batch as batch_mod
 from . import graph, migrate, pipeline, report, seed, settings, store
 
 BASE = Path(__file__).resolve().parent
@@ -67,11 +69,19 @@ def _run_graph(conn, run_id: str):
     return data, levels
 
 
+def _active_run_id(conn) -> str | None:
+    """当前生效结论；未登记或指向失效记录时回退最近一条 run（兼容老库）。"""
+    run_id = store.get_active_run_id(conn)
+    if run_id and store.load_run(conn, run_id):
+        return run_id
+    runs = store.list_runs(conn, limit=1)
+    return runs[0]["run_id"] if runs else None
+
+
 def _catalog(conn) -> dict[str, list[str]]:
     schemas = store.load_schemas(conn)
-    runs = store.list_runs(conn, limit=1)
-    if runs:
-        run_id = runs[0]["run_id"]
+    run_id = _active_run_id(conn)
+    if run_id:
         data = store.load_run(conn, run_id)
         if data:
             for e in data["table_edges"]:
@@ -107,49 +117,104 @@ def _errors_payload(analysis: dict) -> list[dict]:
     return errors
 
 
-def _execute(conn, mode: str, sql: str, filename: str) -> tuple[str | None, dict, str | None]:
-    """返回 (run_id, analysis, error_message)。解析 0 条成功 → 不落库并带诊断返回。"""
+def _execute(conn, mode: str, sql: str, filename: str) -> tuple[str | None, dict, str | None, dict | None]:
+    """返回 (run_id, analysis, error_message, batch_outcome)。
+
+    样例批次走批次登记：只有全部脚本解析成功且零缺失才切换生效结论；
+    失败时 run_id 为 None、原结论保留，batch_outcome 带失败位置与未完成引用。
+    自定义单脚本仍是独立 run（不参与批次切换，避免污染生效结论）；
+    全部解析失败 → 不落库并带诊断返回。
+    """
     if mode in {"sample", "sample_broken"}:
         files = pipeline.load_sample_files(settings.SAMPLE_DIR, include_broken=(mode == "sample_broken"))
         schemas = pipeline.load_schemas(settings.SAMPLE_DIR)
         label = pipeline.SAMPLE_WITH_BROKEN_LABEL if mode == "sample_broken" else pipeline.SAMPLE_LABEL
-    else:
-        if not sql or not sql.strip():
-            return None, {}, "SQL 不能为空：请粘贴 CREATE TABLE/VIEW ... AS SELECT 或 INSERT INTO ... SELECT"
-        files = [{"filename": (filename or "自定义脚本.sql").strip() or "自定义脚本.sql", "sql": sql}]
-        schemas = pipeline.load_schemas(settings.SAMPLE_DIR)
-        if not schemas:
-            schemas = store.load_schemas(conn)
-        label = f"自定义录入 · {files[0]['filename']}"
+        outcome = batch_mod.submit_batch(conn, files, schemas, label, mode)
+        if outcome["switched"]:
+            data = store.load_run(conn, outcome["run_id"])
+            analysis = {
+                "scripts": data["scripts"],
+                "diagnostics": [],
+                "parsed_count": data["run"]["parsed_count"],
+                "failed_count": 0,
+            }
+            return outcome["run_id"], analysis, None, outcome
+        # 失败批次：不产生新 run、不切换，保留原结论与失败位置。
+        analysis = {
+            "scripts": [],
+            "diagnostics": [
+                {
+                    "filename": f["filename"],
+                    "line": f["line"],
+                    "col": f["col"],
+                    "message": f["message"],
+                }
+                for f in outcome["failures"]
+            ],
+            "parsed_count": 0,
+            "failed_count": len(outcome["failures"]),
+        }
+        msg = (
+            f"批次 {outcome['parsed_count']}/{outcome['expected_count']} 解析成功，"
+            f"{outcome['failed_count']} 个脚本未通过、缺失 {outcome['missing_count']} 项；"
+            "血缘/影响面/迁移结论保持上一版，未切换。修复后可在工作台重试该批次（只处理失败项）。"
+        )
+        return None, analysis, msg, outcome
+
+    if not sql or not sql.strip():
+        return None, {}, "SQL 不能为空：请粘贴 CREATE TABLE/VIEW ... AS SELECT 或 INSERT INTO ... SELECT", None
+    files = [{"filename": (filename or "自定义脚本.sql").strip() or "自定义脚本.sql", "sql": sql}]
+    schemas = pipeline.load_schemas(settings.SAMPLE_DIR)
+    if not schemas:
+        schemas = store.load_schemas(conn)
+    label = f"自定义录入 · {files[0]['filename']}"
     analysis = pipeline.analyze(files, schemas)
     if analysis["parsed_count"] == 0:
         first = next((s for s in analysis["scripts"] if s["status"] == "error"), None)
         msg = first["message"] if first else "全部脚本解析失败"
-        return None, analysis, f"全部 {len(files)} 个脚本都未能解析：{msg}"
+        return None, analysis, f"全部 {len(files)} 个脚本都未能解析：{msg}", None
     run_id = pipeline.persist(conn, analysis, label)
-    return run_id, analysis, None
+    return run_id, analysis, None, None
 
 
 def _workbench_context(conn, ctx: dict) -> dict:
-    """工作台右栏只读装配：最近一次解析的诊断 / 血缘 / 环，不重新计算任何算法。"""
+    """工作台右栏只读装配：生效结论的诊断 / 血缘 / 环，以及未关闭批次的失败项。"""
+    active_id = _active_run_id(conn)
     latest = ctx["stats"]["latest_run"]
     failures: list[dict] = []
     column_groups: list[dict] = []
     cycles: list[dict] = []
-    if latest:
-        run_data, _ = _run_graph(conn, latest["run_id"])
+    active_run = None
+    if active_id:
+        run_data, _ = _run_graph(conn, active_id)
         if run_data:
+            active_run = run_data["run"]
             failures = report.failed_scripts(run_data["scripts"])
             column_groups = report.grouped_columns(run_data["column_edges"])
             cycles = [c for c in run_data["cycles"] if c["level"] == "table"]
+
+    open_batches = [b for b in store.list_batches(conn, limit=10) if b["status"] != "switched"]
+    open_views = []
+    for b in open_batches:
+        view = store.load_batch_view(conn, b["batch_id"])
+        open_views.append(
+            {
+                "batch": view["batch"],
+                "failures": report.failed_scripts(view["scripts"]),
+                "scripts": view["scripts"],
+            }
+        )
     ctx.update(
         {
             "scripts": store.list_scripts(conn),
             "runs": store.list_runs(conn, limit=8),
             "latest": latest,
+            "active_run": active_run,
+            "active_run_id": active_id,
             "failures": failures,
             "column_groups": column_groups,
             "cycles": cycles,
+            "open_batches": open_views,
         }
     )
     return ctx
@@ -176,6 +241,7 @@ def index(request: Request):
                 "scripts": scripts,
                 "schemas": store.load_schemas(conn),
                 "latest": latest,
+                "active_run_id": _active_run_id(conn),
                 "runs": store.list_runs(conn, limit=6),
                 "run_data": run_data,
                 "cycles": cycles,
@@ -204,7 +270,7 @@ async def submit_run_form(request: Request):
     filename = str(form.get("filename") or "自定义脚本.sql")
     conn = get_conn()
     try:
-        run_id, analysis, err = _execute(conn, mode, sql, filename)
+        run_id, analysis, err, outcome = _execute(conn, mode, sql, filename)
         if err or run_id is None:
             ctx = _workbench_context(conn, base_context(request, "workbench"))
             ctx.update(
@@ -213,12 +279,50 @@ async def submit_run_form(request: Request):
                     "diagnostics": _errors_payload(analysis),
                     "sql": sql,
                     "filename": filename,
+                    "batch_outcome": outcome,
                 }
             )
             return templates.TemplateResponse(request, "workbench.html", ctx, status_code=422)
     finally:
         conn.close()
     return RedirectResponse(url=f"/result/{run_id}", status_code=303)
+
+
+@app.post("/batches/{batch_id}/retry")
+async def retry_batch_form(request: Request, batch_id: str):
+    """页面表单：重试未关闭批次，只处理失败项；支持随表提交修正后的 SQL。"""
+    form = await request.form()
+    overrides: dict[str, str] = {}
+    for key, value in form.items():
+        if key.startswith("sql:") and str(value).strip():
+            overrides[key[4:]] = str(value)
+    conn = get_conn()
+    try:
+        if store.get_batch(conn, batch_id) is None:
+            ctx = _workbench_context(conn, base_context(request, "workbench"))
+            ctx["error"] = f"找不到批次 {batch_id}"
+            return templates.TemplateResponse(request, "workbench.html", ctx, status_code=404)
+        schemas = pipeline.load_schemas(settings.SAMPLE_DIR) or store.load_schemas(conn)
+        outcome = batch_mod.retry_batch(conn, batch_id, overrides=overrides or None, schemas=schemas)
+        if outcome["switched"]:
+            return RedirectResponse(url=f"/result/{outcome['run_id']}", status_code=303)
+        ctx = _workbench_context(conn, base_context(request, "workbench"))
+        ctx.update(
+            {
+                "error": (
+                    f"批次仍有 {outcome['failed_count']} 个脚本未通过（第 {outcome['attempts']} 次尝试），"
+                    "生效结论保持上一版；请按下方失败位置修复后再次重试。"
+                ),
+                "diagnostics": [
+                    {"filename": f["filename"], "line": f["line"], "col": f["col"], "message": f["message"]}
+                    for f in outcome["failures"]
+                ],
+                "batch_outcome": outcome,
+            }
+        )
+        return templates.TemplateResponse(request, "workbench.html", ctx, status_code=422)
+    finally:
+        conn.close()
 
 
 @app.get("/result/{run_id}", response_class=HTMLResponse)
@@ -233,6 +337,11 @@ def result_page(request: Request, run_id: str):
         run = data["run"]
         groups = report.grouped_columns(data["column_edges"])
         failures = report.failed_scripts(data["scripts"])
+        switch_diff = None
+        if run.get("batch_id"):
+            batch = store.get_batch(conn, run["batch_id"])
+            if batch and batch.get("switch_diff_json"):
+                switch_diff = json.loads(batch["switch_diff_json"])
         table_groups: dict[str, list[dict]] = {}
         for e in data["table_edges"]:
             table_groups.setdefault(e["target_table"], []).append(e)
@@ -252,6 +361,7 @@ def result_page(request: Request, run_id: str):
                 "column_cycles": [c for c in data["cycles"] if c["level"] == "column"],
                 "failures": failures,
                 "levels": levels,
+                "switch_diff": switch_diff,
                 "seed_rows": seed_rows,
                 "star_edge_count": sum(1 for e in data["column_edges"] if e["star_expanded"]),
                 "transform_edge_count": sum(1 for e in data["column_edges"] if e["transforms"]),
@@ -279,12 +389,13 @@ def review_page(
             ctx = base_context(request, "review")
             ctx["error"] = "还没有任何解析记录，请先到工作台执行样例解析。"
             return templates.TemplateResponse(request, "review.html", ctx)
-        target_run = run_id or runs[0]["run_id"]
+        active_id = _active_run_id(conn)
+        target_run = run_id or active_id or runs[0]["run_id"]
         data, levels = _run_graph(conn, target_run)
         if data is None:
             ctx = base_context(request, "review")
-            ctx["error"] = f"找不到运行记录 {run_id}，已回退到最近一次解析。"
-            target_run = runs[0]["run_id"]
+            ctx["error"] = f"找不到运行记录 {run_id}，已回退到当前生效结论。"
+            target_run = active_id or runs[0]["run_id"]
             data, levels = _run_graph(conn, target_run)
         catalog = _catalog(conn)
         table_options = sorted({e["target_table"] for e in data["table_edges"]} | set(store.load_schemas(conn)))
@@ -306,6 +417,7 @@ def review_page(
             {
                 "runs": runs,
                 "run_id": target_run,
+                "active_run_id": active_id,
                 "run": data["run"],
                 "table_options": table_options,
                 "table": table_choice,
@@ -343,6 +455,7 @@ def health():
         "broken_scripts": stats["broken_scripts"],
         "schema_tables": stats["schema_tables"],
         "runs": stats["runs"],
+        "active_run_id": stats["active_run_id"],
     }
 
 
@@ -355,11 +468,15 @@ def api_create_run(payload: dict = Body(default={})):
         raise HTTPException(status_code=400, detail=f"不支持的模式 {mode}；可选 sample / sample_broken / custom")
     conn = get_conn()
     try:
-        run_id, analysis, err = _execute(conn, mode, sql, filename)
+        run_id, analysis, err, outcome = _execute(conn, mode, sql, filename)
         if run_id is None:
             raise HTTPException(
                 status_code=422,
-                detail={"message": err, "errors": _errors_payload(analysis)},
+                detail={
+                    "message": err,
+                    "errors": _errors_payload(analysis),
+                    "batch": outcome,
+                },
             )
         data = store.load_run(conn, run_id)
         return {
@@ -372,6 +489,8 @@ def api_create_run(payload: dict = Body(default={})):
             "column_edge_count": data["run"]["column_edge_count"],
             "cycle_count": data["run"]["cycle_count"],
             "diagnostics": _errors_payload(analysis),
+            "batch": outcome,
+            "active_run_id": store.get_active_run_id(conn),
         }
     finally:
         conn.close()
@@ -382,6 +501,70 @@ def api_list_runs(limit: int = 10):
     conn = get_conn()
     try:
         return {"runs": store.list_runs(conn, limit=max(1, min(limit, 50)))}
+    finally:
+        conn.close()
+
+
+@app.get("/api/batches")
+def api_list_batches(limit: int = 20):
+    conn = get_conn()
+    try:
+        rows = store.list_batches(conn, limit=max(1, min(limit, 100)))
+        for b in rows:
+            b["switch_diff"] = (
+                json.loads(b["switch_diff_json"]) if b.get("switch_diff_json") else None
+            )
+        return {"batches": rows, "active_run_id": store.get_active_run_id(conn)}
+    finally:
+        conn.close()
+
+
+@app.get("/api/batches/{batch_id}")
+def api_get_batch(batch_id: str):
+    conn = get_conn()
+    try:
+        view = store.load_batch_view(conn, batch_id)
+        if view is None:
+            raise HTTPException(status_code=404, detail=f"找不到批次 {batch_id}")
+        view["scripts"] = [
+            {
+                "filename": s["filename"],
+                "target": s["target"],
+                "kind": s["kind"],
+                "status": s["status"],
+                "columns": s["columns"],
+                "attempts": s["attempts"],
+                "error": (
+                    {"line": s.get("error_line"), "col": s.get("error_col"), "message": s.get("message")}
+                    if s["status"] != "ok"
+                    else None
+                ),
+            }
+            for s in view["scripts"]
+        ]
+        view["active_run_id"] = store.get_active_run_id(conn)
+        return view
+    finally:
+        conn.close()
+
+
+@app.post("/api/batches/{batch_id}/retry")
+def api_retry_batch(batch_id: str, payload: dict = Body(default={})):
+    """补齐后重试同一批：只处理失败项，不新增重复批次；可携带修正后的 SQL。"""
+    conn = get_conn()
+    try:
+        if store.get_batch(conn, batch_id) is None:
+            raise HTTPException(status_code=404, detail=f"找不到批次 {batch_id}")
+        raw_overrides = payload.get("scripts") or []
+        overrides: dict[str, str] = {}
+        for item in raw_overrides:
+            name = item.get("filename")
+            sql_text = item.get("sql")
+            if name and sql_text:
+                overrides[str(name)] = str(sql_text)
+        outcome = batch_mod.retry_batch(conn, batch_id, overrides=overrides or None,
+                                        schemas=pipeline.load_schemas(settings.SAMPLE_DIR) or store.load_schemas(conn))
+        return outcome
     finally:
         conn.close()
 
@@ -447,6 +630,16 @@ def _impact_for(run_id: str, table: str, column: str | None) -> tuple[dict, dict
         data, levels = _run_graph(conn, run_id)
         if data is None:
             raise HTTPException(status_code=404, detail=f"找不到运行记录 {run_id}")
+        active_id = _active_run_id(conn)
+        # 影响面 / 迁移清单只能基于当前生效结论，避免失败批次的半成品导致漏删下游。
+        if active_id and run_id != active_id:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    f"运行 {run_id} 不是当前生效结论（active_run_id={active_id}）；"
+                    "失败批次不会切换血缘与迁移方案，请改用生效结论或先把批次重试到全部成功。"
+                ),
+            )
         if not table:
             raise HTTPException(status_code=400, detail="缺少 table 参数（例如 ods_orders）")
         impact = graph.impact(data["table_edges"], data["column_edges"], levels, table, column or None)

@@ -14,8 +14,9 @@
   <div>
     <h1 class="page-title">SQL 工作台</h1>
     <p class="page-sub">
-      选择样例集一键解析，或粘贴一条自定义脚本；解析结果会进入结果页并落到 SQLite 历史里。
-      失败脚本不会影响其它脚本的血缘结果，但会单独列出错误行列位置。
+      选择样例集一键解析，或粘贴一条自定义脚本；批次会先登记全部应到脚本，
+      只有全部解析成功且缺失项为零，才一次性切换血缘、影响面与迁移结论。
+      失败批次保留上一版结论与失败位置，补齐后重试同一批只处理失败项。
     </p>
   </div>
 </div>
@@ -124,6 +125,84 @@ FROM ods_orders o;">{{ sql or '' }}</textarea>
           </tbody>
         </table>
       </div>
+      {% if batch_outcome and not batch_outcome.switched %}
+      <div class="panel-body tight">
+        <div class="alert alert-error small" role="alert">
+          批次 {{ batch_outcome.parsed_count }}/{{ batch_outcome.expected_count }} 成功，
+          {{ batch_outcome.failed_count }} 个脚本未通过、缺失 {{ batch_outcome.missing_count }} 项；
+          血缘 / 影响面 / 迁移结论保持上一版（active run：<span class="mono">{{ batch_outcome.active_run_id or '尚无' }}</span>），未做切换。
+        </div>
+      </div>
+      {% endif %}
+    </section>
+    {% endif %}
+
+    {% if active_run %}
+    <section class="panel">
+      <div class="panel-head">
+        <h2>当前生效结论</h2>
+        <div class="panel-actions">
+          <span class="tag ok">active</span>
+          <span class="tag">{{ active_run.created_at }}</span>
+        </div>
+      </div>
+      <div class="panel-body tight small">
+        <div>run_id：<span class="mono">{{ active_run.run_id }}</span></div>
+        <div class="muted">{{ active_run.source_label }} · 脚本 {{ active_run.parsed_count }}/{{ active_run.script_count }} · 表边 {{ active_run.table_edge_count }} · 列边 {{ active_run.column_edge_count }}</div>
+        <div style="margin-top:6px">
+          <a class="btn secondary small" href="/result/{{ active_run.run_id }}">查看生效血缘</a>
+          <a class="btn secondary small" href="/review?run_id={{ active_run.run_id }}&table=ods_orders&column=amount&op=drop">查影响面 / 迁移</a>
+        </div>
+      </div>
+    </section>
+    {% endif %}
+
+    {% if open_batches %}
+    <section class="panel">
+      <div class="panel-head">
+        <h2>未关闭批次（{{ open_batches|length }}）</h2>
+        <div class="panel-actions"><span class="tag warn">结论未切换</span></div>
+      </div>
+      {% for ob in open_batches %}
+      <div class="panel-body tight" style="border-bottom:1px solid var(--line)">
+        <div class="small">
+          <strong class="mono">{{ ob.batch.batch_id }}</strong>
+          <span class="tag">{{ ob.batch.source_label }}</span>
+          <span class="tag">应到 {{ ob.batch.expected_count }} · 成功 {{ ob.batch.parsed_count }} · 失败 {{ ob.batch.failed_count }}</span>
+          <span class="tag">尝试 {{ ob.batch.attempts }} 次</span>
+        </div>
+        {% if ob.failures %}
+        <form method="post" action="/batches/{{ ob.batch.batch_id }}/retry">
+          <div class="table-wrap auto" style="margin-top:6px">
+            <table class="dense">
+              <thead><tr><th>失败脚本</th><th>位置</th><th>原因</th><th>修正后的 SQL（可留空按原文重试）</th></tr></thead>
+              <tbody>
+                {% for f in ob.failures %}
+                <tr>
+                  <td class="mono nowrap">{{ f.filename }}</td>
+                  <td class="nowrap">{% if f.line %}<span class="tag err">第 {{ f.line }} 行第 {{ f.col }} 列</span>{% else %}—{% endif %}</td>
+                  <td class="small">{{ f.message }}</td>
+                  <td><textarea name="sql:{{ f.filename }}" rows="4" style="min-width:280px" spellcheck="false" placeholder="粘贴修正后的完整 SQL；留空则按原脚本重试"></textarea></td>
+                </tr>
+                {% endfor %}
+              </tbody>
+            </table>
+          </div>
+          <div class="panel-actions" style="padding-left:0">
+            <button type="submit" class="small">重试该批次（只处理失败项）</button>
+            <span class="small muted">重试复用同一批次，不新增重复批次；全部成功后一次性切换并给出引用差异。</span>
+          </div>
+        </form>
+        {% endif %}
+        {% if ob.batch.switch_diff and ob.batch.switch_diff.unresolved %}
+        <div class="alert alert-error small" style="margin-top:6px">
+          仍未完成的引用（{{ ob.batch.switch_diff.unresolved|length }}）：
+          {% for u in ob.batch.switch_diff.unresolved %}<span class="mono">{{ u.filename }}</span>{% if not loop.last %}、{% endif %}{% endfor %}
+          —— 这些下游在结论切换前不会进入迁移清单，避免漏判未知下游。
+        </div>
+        {% endif %}
+      </div>
+      {% endfor %}
     </section>
     {% endif %}
 
@@ -236,7 +315,7 @@ FROM ods_orders o;">{{ sql or '' }}</textarea>
           <tbody>
             {% for r in runs %}
             <tr>
-              <td class="nowrap"><span class="small muted">{{ r.created_at }}</span><div class="small mono">{{ r.run_id }}</div></td>
+              <td class="nowrap"><span class="small muted">{{ r.created_at }}</span>{% if r.run_id == active_run_id %} <span class="tag ok">生效</span>{% endif %}<div class="small mono">{{ r.run_id }}</div></td>
               <td class="cell-ellipsis">{{ r.source_label }}</td>
               <td>{{ r.parsed_count }}/{{ r.script_count }}</td>
               <td>{{ r.column_edge_count }}</td>

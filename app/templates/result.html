@@ -64,6 +64,66 @@
   </div>
 </div>
 
+{% if switch_diff %}
+<div class="panel" style="margin-bottom:12px">
+  <div class="panel-head">
+    <h2>本次切换的引用差异（相对上一版生效结论）</h2>
+    <div class="panel-actions">
+      <span class="tag ok">新增表边 {{ switch_diff.summary.table_added }} / 列边 {{ switch_diff.summary.column_added }}</span>
+      <span class="tag warn">消失表边 {{ switch_diff.summary.table_removed }} / 列边 {{ switch_diff.summary.column_removed }}</span>
+      <span class="tag {% if switch_diff.summary.unresolved_count %}err{% else %}ok{% endif %}">仍未完成 {{ switch_diff.summary.unresolved_count }}</span>
+    </div>
+  </div>
+  <div class="split result">
+    <div>
+      <h3 class="small" style="margin:8px 0 4px">新增的引用（切换后进入血缘 / 影响面 / 迁移方案）</h3>
+      <div class="table-wrap auto">
+        <table class="dense">
+          <thead><tr><th>级别</th><th>来源</th><th>目标</th></tr></thead>
+          <tbody>
+            {% for e in switch_diff.table.added %}
+            <tr><td><span class="tag ok">表</span></td><td class="mono">{{ e.source_table }}</td><td class="mono">{{ e.target_table }}</td></tr>
+            {% endfor %}
+            {% for e in switch_diff.column.added %}
+            <tr><td><span class="tag">列</span></td><td class="mono">{{ e.source_table }}.{{ e.source_column }}</td><td class="mono">{{ e.target_table }}.{{ e.target_column }}</td></tr>
+            {% endfor %}
+            {% if not switch_diff.table.added and not switch_diff.column.added %}
+            <tr><td colspan="3" class="muted small">无新增引用</td></tr>
+            {% endif %}
+          </tbody>
+        </table>
+      </div>
+    </div>
+    <div>
+      <h3 class="small" style="margin:8px 0 4px">消失的引用（切换后不再属于结论，迁移清单据此剔除）</h3>
+      <div class="table-wrap auto">
+        <table class="dense">
+          <thead><tr><th>级别</th><th>来源</th><th>目标</th></tr></thead>
+          <tbody>
+            {% for e in switch_diff.table.removed %}
+            <tr><td><span class="tag warn">表</span></td><td class="mono">{{ e.source_table }}</td><td class="mono">{{ e.target_table }}</td></tr>
+            {% endfor %}
+            {% for e in switch_diff.column.removed %}
+            <tr><td><span class="tag">列</span></td><td class="mono">{{ e.source_table }}.{{ e.source_column }}</td><td class="mono">{{ e.target_table }}.{{ e.target_column }}</td></tr>
+            {% endfor %}
+            {% if not switch_diff.table.removed and not switch_diff.column.removed %}
+            <tr><td colspan="3" class="muted small">无消失引用</td></tr>
+            {% endif %}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  </div>
+  {% if switch_diff.unresolved %}
+  <div class="panel-body tight">
+    <div class="alert alert-error small">仍未完成的引用（{{ switch_diff.unresolved|length }}）：
+      {% for u in switch_diff.unresolved %}<div class="mono">{{ u.filename }}（第 {{ u.line }} 行第 {{ u.col }} 列：{{ u.message }}）</div>{% endfor %}
+    </div>
+  </div>
+  {% endif %}
+</div>
+{% endif %}
+
 <div class="panel">
   <div class="panel-head">
     <div class="segmented">

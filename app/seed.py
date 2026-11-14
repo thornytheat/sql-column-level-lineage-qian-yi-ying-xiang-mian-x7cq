@@ -24,12 +24,16 @@ def ensure_seed(conn, sample_dir: Path | None = None, seed_run: bool = True) -> 
     )
     expected = (len(sample_scripts) + len(broken_scripts), len(schema_files))
     if version == settings.SEED_VERSION and counts == expected:
+        baseline = store.get_meta(conn, "baseline_run_id")
+        # 即使跳过写入，也要保证生效结论指针存在（老库 / 重启场景）。
+        if baseline and not store.get_active_run_id(conn):
+            store.set_active_run_id(conn, baseline)
         return {
             "seeded": False,
             "reason": "seed_version 命中，跳过",
             "scripts": counts[0],
             "schemas": counts[1],
-            "baseline_run_id": store.get_meta(conn, "baseline_run_id"),
+            "baseline_run_id": baseline,
         }
 
     with conn:
@@ -60,6 +64,11 @@ def ensure_seed(conn, sample_dir: Path | None = None, seed_run: bool = True) -> 
         run_id, _ = pipeline.run_sample(conn, sample_dir)
         store.set_meta(conn, "baseline_run_id", run_id)
         baseline = run_id
+    # 基线即首个生效结论；之后只有全量成功的批次才能原子切换 active_run_id。
+    if baseline and not store.get_active_run_id(conn):
+        store.set_active_run_id(conn, baseline)
+    # set_meta 自身不提交，这里显式 commit，避免连接关闭后基线 / 生效指针回滚丢失。
+    conn.commit()
 
     return {
         "seeded": True,

@@ -39,17 +39,28 @@ def test_create_sample_run(client):
     assert body["diagnostics"] == []
 
 
-def test_create_run_with_broken_script_keeps_others(client):
+def test_create_run_with_broken_script_does_not_switch(client):
+    """坏批次：不落新结论、不切换 active run，失败位置与未完成引用随 422 返回。"""
+    before = client.get("/health").json()
     res = client.post("/api/runs", json={"mode": "sample_broken"})
-    assert res.status_code == 200, res.text
-    body = res.json()
-    assert body["script_count"] == 13
-    assert body["parsed_count"] == 12
-    assert body["failed_count"] == 1
-    err = body["diagnostics"][0]
+    assert res.status_code == 422
+    detail = res.json()["detail"]
+    batch = detail["batch"]
+    assert batch["switched"] is False
+    assert batch["run_id"] is None
+    assert batch["expected_count"] == 13
+    assert batch["parsed_count"] == 12
+    assert batch["failed_count"] == 1
+    assert batch["missing_count"] == 0
+    err = batch["failures"][0]
     assert err["filename"] == "13_broken_channel.sql"
     assert (err["line"], err["col"]) == (5, 8)
     assert "括号未闭合" in err["message"]
+    # 生效结论仍是上一版，迁移依据没有被半成品覆盖。
+    after = client.get("/health").json()
+    assert after["runs"] == before["runs"]
+    assert detail["errors"][0]["filename"] == "13_broken_channel.sql"
+    assert (detail["errors"][0]["line"], detail["errors"][0]["col"]) == (5, 8)
 
 
 def test_broken_sql_returns_422_with_position(client):
